@@ -12,6 +12,8 @@ import docx  # for DOCX extraction (placeholder)
 import openai  # for ChatGPT API
 from git import Repo  # for Git integration (optional)
 from moviepy.editor import ImageClip, concatenate_videoclips
+from dotenv import load_dotenv
+load_dotenv()
 
 # ---------------------------
 # SET YOUR API KEYS / CONFIG
