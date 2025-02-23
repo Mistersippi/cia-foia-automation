@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 from apscheduler.schedulers.background import BackgroundScheduler
 from bs4 import BeautifulSoup
 import requests
@@ -6,22 +6,28 @@ import time
 import logging
 import os
 from datetime import datetime, timedelta
+import io
+import zipfile
 from pyairtable import Table
-from pdfminer.high_level import extract_text  # for PDF extraction (placeholder)
-import docx  # for DOCX extraction (placeholder)
-import openai  # for ChatGPT API
-from git import Repo  # for Git integration (optional)
-from moviepy.editor import ImageClip, concatenate_videoclips
+from pdfminer.high_level import extract_text  # Placeholder for PDF extraction
+import docx  # Placeholder for DOCX extraction
+import openai  # For ChatGPT API
+from git import Repo  # Optional: for Git integration
+import subprocess  # For calling FFmpeg (if needed for future features)
 from dotenv import load_dotenv
+
+# Load environment variables from .env file
 load_dotenv()
 
 # ---------------------------
-# SET YOUR API KEYS / CONFIG
+# SET YOUR API KEYS / CONFIG HERE
 # ---------------------------
 openai.api_key = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
 AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "YOUR_AIRTABLE_API_KEY_HERE")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "YOUR_AIRTABLE_BASE_ID_HERE")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Documents")
+AIRTABLE_IMAGE_PROMPTS_TABLE = os.getenv("AIRTABLE_IMAGE_PROMPTS_TABLE", "ImagePrompts")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "YOUR_ELEVENLABS_API_KEY_HERE")
 # ---------------------------
 
 logging.basicConfig(level=logging.INFO)
@@ -29,40 +35,46 @@ BASE_URL = "https://www.cia.gov"
 
 app = Flask(__name__)
 
-# Set up Airtable connection
-table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
+# ---------------------------
+# AIRTABLE DATABASE FUNCTIONS
+# ---------------------------
+documents_table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
+image_prompts_table = Table(AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_IMAGE_PROMPTS_TABLE)
 
-# ---------------------------
-# DATABASE FUNCTIONS (Using Airtable)
-# ---------------------------
 def store_document(title, url, report, summary, video_script, video_file):
-    # Check if the document already exists in Airtable
-    records = table.all(formula=f"{{url}} = '{url}'")
+    data = {
+        "title": title,
+        "url": url,
+        "report": report,
+        "summary": summary,
+        "video_script": video_script,
+        "video_file": video_file,
+        "processed_at": datetime.now().isoformat()
+    }
+    records = documents_table.all(formula=f"{{url}} = '{url}'")
     if not records:
+        documents_table.create(data)
+
+def store_image_prompts(document_url, prompts):
+    for i, prompt in enumerate(prompts, start=1):
         data = {
-            "title": title,
-            "url": url,
-            "report": report,
-            "summary": summary,
-            "video_script": video_script,
-            "video_file": video_file,
-            "processed_at": datetime.now().isoformat()
+            "document_url": document_url,
+            "prompt_index": i,
+            "prompt": prompt,
+            "image_url": ""
         }
-        table.create(data)
+        image_prompts_table.create(data)
 
 def search_documents(keyword, start_date, end_date):
-    # Build a formula to search by keyword in title, report, or summary.
     formula_parts = []
     if keyword:
-        # Escape single quotes if necessary.
-        keyword = keyword.replace("'", "\\'")
-        formula_parts.append(f"FIND('{keyword}', {{title}})")
-        formula_parts.append(f"FIND('{keyword}', {{report}})")
-        formula_parts.append(f"FIND('{keyword}', {{summary}})")
+        keyword_escaped = keyword.replace("'", "\\'")
+        formula_parts.append(f"FIND('{keyword_escaped}', {{title}})")
+        formula_parts.append(f"FIND('{keyword_escaped}', {{report}})")
+        formula_parts.append(f"FIND('{keyword_escaped}', {{summary}})")
         search_formula = "OR(" + ", ".join(formula_parts) + ")"
     else:
         search_formula = ""
-    # Date filtering
     date_formula = ""
     if start_date:
         date_formula = f"IS_AFTER({{processed_at}}, '{start_date}')"
@@ -79,15 +91,14 @@ def search_documents(keyword, start_date, end_date):
         formula = date_formula
     else:
         formula = ""
-    return table.all(formula=formula) if formula else table.all()
+    return documents_table.all(formula=formula) if formula else documents_table.all()
 
 # ---------------------------
-# SCRAPING & SEARCH FUNCTIONS
+# SCRAPING FUNCTIONS
 # ---------------------------
 def build_cia_search_url(keyword, start_date, end_date):
-    # Convert dates to format: YYYY-MM-DDT00%3A00%3A00Z
     start_str = f"{start_date}T00%3A00%3A00Z" if start_date else "1900-01-01T00%3A00%3A00Z"
-    end_str   = f"{end_date}T00%3A00%3A00Z"   if end_date else "2100-01-01T00%3A00%3A00Z"
+    end_str = f"{end_date}T00%3A00%3A00Z" if end_date else "2100-01-01T00%3A00%3A00Z"
     date_filter = f"f%5B0%5D=ds_created%3A%5B{start_str}%20TO%20{end_str}%5D"
     keyword_path = f"/readingroom/search/site/{keyword}" if keyword else "/readingroom/search/site"
     full_url = f"{BASE_URL}{keyword_path}?{date_filter}"
@@ -154,7 +165,6 @@ def extract_text_from_file(file_content, file_url):
 
 def call_chatgpt_report(text):
     prompt = f"Generate a detailed report based on the following text:\n\n{text}"
-    # Replace with a real API call:
     return "Detailed report (placeholder)."
 
 def call_chatgpt_summary(report):
@@ -162,38 +172,26 @@ def call_chatgpt_summary(report):
     return "Bullet-point summary (placeholder)."
 
 def call_video_script(report):
-    prompt = f"Convert the following detailed report into a video script for a 5-minute faceless YouTube video:\n\n{report}"
+    prompt = f"Convert the following detailed report into a 5-minute voiceover/video script:\n\n{report}"
     return "Video script (placeholder)."
 
-def split_script_into_segments(script, segment_duration=5):
-    sentences = script.split('.')
-    segments = [s.strip() for s in sentences if s.strip()]
-    return segments
+# ---------------------------
+# IMAGE PROMPT GENERATION FUNCTIONS
+# ---------------------------
+def generate_image_prompts(video_script, num_prompts=60):
+    segments = [s.strip() for s in video_script.split('.') if s.strip()]
+    if len(segments) < num_prompts:
+        segments += [segments[-1]] * (num_prompts - len(segments))
+    else:
+        segments = segments[:num_prompts]
+    prompts = [f"Generate an image that illustrates: {seg}" for seg in segments]
+    return prompts
 
-def generate_image_for_segment(segment_text):
-    # Using Midjourney is manual or through a Discord bot typically.
-    # For this placeholder, return a placeholder image URL.
-    return "https://via.placeholder.com/512"
+# Note: `store_image_prompts` is already defined under AIRTABLE DATABASE FUNCTIONS
 
-def generate_images_for_script(script):
-    segments = split_script_into_segments(script)
-    image_urls = []
-    for segment in segments:
-        img_url = generate_image_for_segment(segment)
-        image_urls.append(img_url)
-        time.sleep(1)
-    return image_urls
-
-def create_video_from_images(image_urls, segment_duration=5, output_filename="output_video.mp4"):
-    clips = []
-    for img_url in image_urls:
-        # Note: If img_url is a remote URL, you must download the image and save locally first.
-        clip = ImageClip(img_url).set_duration(segment_duration)
-        clips.append(clip)
-    video = concatenate_videoclips(clips, method="compose")
-    video.write_videofile(output_filename, fps=24)
-    return output_filename
-
+# ---------------------------
+# FULL DOCUMENT PROCESSING PIPELINE
+# ---------------------------
 def process_document(doc_title, doc_url):
     logging.info(f"Processing document: {doc_url}")
     soup = fetch_page(doc_url)
@@ -208,10 +206,10 @@ def process_document(doc_title, doc_url):
             report = call_chatgpt_report(text)
             summary = call_chatgpt_summary(report)
             video_script = call_video_script(report)
-            image_urls = generate_images_for_script(video_script)
-            video_file = create_video_from_images(image_urls)
-            store_document(doc_title, doc_url, report, summary, video_script, video_file)
-            return {"report": report, "summary": summary, "video_script": video_script, "video_file": video_file}
+            prompts = generate_image_prompts(video_script, num_prompts=60)
+            store_image_prompts(doc_url, prompts)
+            store_document(doc_title, doc_url, report, summary, video_script, "Prompts Generated")
+            return {"report": report, "summary": summary, "video_script": video_script, "video_file": "Prompts Generated"}
     logging.error("Download link not found or file download failed.")
     return None
 
@@ -264,7 +262,7 @@ def search_cia():
                     results.append({
                         "title": d["title"],
                         "url": d["url"],
-                        "report": "Already in DB or no link found",
+                        "report": "Already in Airtable or no link found",
                         "summary": "",
                         "video_script": "",
                         "video_file": ""
@@ -272,8 +270,7 @@ def search_cia():
                 time.sleep(1)
             current_url = get_next_page_url(soup)
         return render_template("search_cia.html", results=results, keyword=keyword, start_date=start_date, end_date=end_date)
-    else:
-        return render_template("search_cia.html", results=None, keyword="", start_date="", end_date="")
+    return render_template("search_cia.html", results=None, keyword="", start_date="", end_date="")
 
 @app.route("/process_document", methods=["POST"])
 def process_document_route():
@@ -284,15 +281,31 @@ def process_document_route():
     result = process_document(doc_title, doc_url)
     if result:
         return jsonify(result)
-    else:
-        return jsonify({"error": "Processing failed."}), 500
+    return jsonify({"error": "Processing failed."}), 500
+
+@app.route("/download_images")
+def download_images():
+    doc_url = request.args.get("doc_url")
+    if not doc_url:
+        return "Missing document URL", 400
+    records = image_prompts_table.all(formula=f"AND({{document_url}} = '{doc_url}', LEN({{image_url}}) > 0)")
+    if not records:
+        return "No images available for this document", 404
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+        for record in records:
+            image_url = record["fields"].get("image_url")
+            if image_url:
+                img_data = requests.get(image_url).content
+                filename = f"prompt_{record['fields'].get('prompt_index')}.png"
+                zip_file.writestr(filename, img_data)
+    zip_buffer.seek(0)
+    return send_file(zip_buffer, mimetype="application/zip", download_name="images.zip", as_attachment=True)
 
 # ---------------------------
 # MAIN EXECUTION
 # ---------------------------
 if __name__ == "__main__":
-    # Initialize Airtable (data will be stored there)
-    # Start the daily update scheduler
     scheduler = BackgroundScheduler()
     scheduler.add_job(daily_update, 'interval', days=1, next_run_time=datetime.now() + timedelta(seconds=10))
     scheduler.start()
